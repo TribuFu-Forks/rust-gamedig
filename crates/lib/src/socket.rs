@@ -12,32 +12,75 @@ use std::{
 
 const DEFAULT_PACKET_SIZE: usize = 1024;
 
+/// A trait defining the basic functionalities of a network socket.
 pub trait Socket {
-    /// Create a new socket and connect to the remote address (if required).
+    /// Create a new socket and connect to the remote address.
     ///
-    /// Calls [Self::apply_timeout] with the given timeout settings.
+    /// # Arguments
+    /// * `address` - The address to connect the socket to.
+    /// * `timeout_settings` - Optional timeout settings for the socket.
+    ///
+    /// # Returns
+    /// A result containing the socket instance or an error.
     fn new(address: &SocketAddr, timeout_settings: &Option<TimeoutSettings>) -> GDResult<Self>
-    where Self: Sized;
+    where
+        Self: Sized;
 
+    /// Apply read and write timeouts to the socket.
+    ///
+    /// # Arguments
+    /// * `timeout_settings` - Optional timeout settings to apply.
+    ///
+    /// # Returns
+    /// A result indicating success or error in applying timeouts.
     fn apply_timeout(&self, timeout_settings: &Option<TimeoutSettings>) -> GDResult<()>;
 
+    /// Send data over the socket.
+    ///
+    /// # Arguments
+    /// * `data` - Data to be sent.
+    ///
+    /// # Returns
+    /// A result indicating success or error in sending data.
     fn send(&mut self, data: &[u8]) -> GDResult<()>;
+
+    /// Receive data from the socket.
+    ///
+    /// # Arguments
+    /// * `size` - Optional size of data to receive.
+    ///
+    /// # Returns
+    /// A result containing received data or an error.
     fn receive(&mut self, size: Option<usize>) -> GDResult<Vec<u8>>;
 
+    /// Get the remote port of the socket.
+    ///
+    /// # Returns
+    /// The port number.
     fn port(&self) -> u16;
+
+    /// Get the local SocketAddr.
+    ///
+    /// # Returns
+    /// The local SocketAddr.
+    fn local_addr(&self) -> std::io::Result<SocketAddr>;
 }
 
-pub struct TcpSocket {
+/// Implementation of a TCP socket.
+pub struct TcpSocketImpl {
+    /// The underlying TCP socket stream.
     socket: net::TcpStream,
+    /// The address of the remote host.
     address: SocketAddr,
 }
 
-impl Socket for TcpSocket {
+impl Socket for TcpSocketImpl {
     fn new(address: &SocketAddr, timeout_settings: &Option<TimeoutSettings>) -> GDResult<Self> {
-        let socket = TimeoutSettings::get_connect_or_default(timeout_settings).map_or_else(
-            || net::TcpStream::connect(address),
-            |timeout| net::TcpStream::connect_timeout(address, timeout),
-        );
+        let socket = if let Some(timeout) = TimeoutSettings::get_connect_or_default(timeout_settings) {
+            net::TcpStream::connect_timeout(address, timeout)
+        } else {
+            net::TcpStream::connect(address)
+        };
 
         let socket = Self {
             socket: socket.map_err(|e| SocketConnect.context(e))?,
@@ -71,15 +114,23 @@ impl Socket for TcpSocket {
         Ok(buf)
     }
 
-    fn port(&self) -> u16 { self.address.port() }
+    fn port(&self) -> u16 {
+        self.address.port()
+    }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
 }
 
-pub struct UdpSocket {
+/// Implementation of a UDP socket.
+pub struct UdpSocketImpl {
+    /// The underlying UDP socket.
     socket: net::UdpSocket,
+    /// The address of the remote host.
     address: SocketAddr,
 }
 
-impl Socket for UdpSocket {
+impl Socket for UdpSocketImpl {
     fn new(address: &SocketAddr, timeout_settings: &Option<TimeoutSettings>) -> GDResult<Self> {
         let socket = net::UdpSocket::bind("0.0.0.0:0").map_err(|e| SocketBind.context(e))?;
 
@@ -116,11 +167,233 @@ impl Socket for UdpSocket {
             .recv_from(&mut buf)
             .map_err(|e| PacketReceive.context(e))?;
 
-        Ok(buf[.. number_of_bytes_received].to_vec())
+        Ok(buf[..number_of_bytes_received].to_vec())
     }
 
-    fn port(&self) -> u16 { self.address.port() }
+    fn port(&self) -> u16 {
+        self.address.port()
+    }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
 }
+
+/// Things used for capturing packets.
+#[cfg(feature = "packet_capture")]
+pub mod capture {
+    use std::{marker::PhantomData, net::SocketAddr};
+
+    use super::{Socket, TcpSocketImpl, UdpSocketImpl};
+
+    use crate::{
+        capture::{
+            packet::CapturePacket,
+            packet::{Direction, Protocol},
+            writer::{Writer, CAPTURE_WRITER},
+        },
+        protocols::types::TimeoutSettings,
+        GDResult,
+    };
+
+    /// Sets a global capture writer for handling all packet data.
+    ///
+    /// # Panics
+    /// Panics if a capture writer is already set.
+    ///
+    /// # Arguments
+    /// * `writer` - A boxed writer that implements the `Writer` trait.
+    pub(crate) fn set_writer(writer: Box<dyn Writer + Send + Sync>) {
+        let mut lock = CAPTURE_WRITER.lock().unwrap();
+
+        if lock.is_some() {
+            panic!("Capture writer already set");
+        }
+
+        *lock = Some(writer);
+    }
+
+    /// A trait representing a provider of a network protocol.
+    pub trait ProtocolProvider {
+        /// Returns the protocol used by the provider.
+        fn protocol() -> Protocol;
+    }
+
+    /// Represents the TCP protocol provider.
+    pub struct ProtocolTCP;
+    impl ProtocolProvider for ProtocolTCP {
+        fn protocol() -> Protocol {
+            Protocol::TCP
+        }
+    }
+
+    /// Represents the UDP protocol provider.
+    pub struct ProtocolUDP;
+    impl ProtocolProvider for ProtocolUDP {
+        fn protocol() -> Protocol {
+            Protocol::UDP
+        }
+    }
+
+    /// A socket wrapper that allows capturing packets.
+    ///
+    /// # Type parameters
+    /// * `I` - The inner socket type.
+    /// * `P` - The protocol provider.
+    #[derive(Clone, Debug)]
+    pub struct WrappedCaptureSocket<I, P> {
+        inner: I,
+        remote_address: SocketAddr,
+        _protocol: PhantomData<P>,
+    }
+
+    impl<I: Socket, P: ProtocolProvider> Socket for WrappedCaptureSocket<I, P> {
+        /// Creates a new wrapped socket for capturing packets.
+        ///
+        /// Initializes a new socket of type `I`, wrapping it to enable packet capturing.
+        /// Capturing is protocol-specific, as indicated by the `ProtocolProvider`.
+        ///
+        /// # Arguments
+        /// * `address` - The address to connect the socket to.
+        /// * `timeout_settings` - Optional timeout settings for the socket.
+        ///
+        /// # Returns
+        /// A `GDResult` containing either the wrapped socket or an error.
+        fn new(address: &SocketAddr, timeout_settings: &Option<TimeoutSettings>) -> GDResult<Self>
+        where
+            Self: Sized,
+        {
+            let v = Self {
+                inner: I::new(address, timeout_settings)?,
+                remote_address: *address,
+                _protocol: PhantomData,
+            };
+
+            let info = CapturePacket {
+                direction: Direction::Send,
+                protocol: P::protocol(),
+                remote_address: address,
+                local_address: &v.local_addr().unwrap(),
+            };
+
+            if let Some(writer) = CAPTURE_WRITER.lock().unwrap().as_mut() {
+                writer.new_connect(&info)?;
+            }
+
+            Ok(v)
+        }
+
+        /// Sends data over the socket and captures the packet.
+        ///
+        /// The method sends data using the inner socket and captures the sent packet
+        /// if a capture writer is set.
+        ///
+        /// # Arguments
+        /// * `data` - Data to be sent.
+        ///
+        /// # Returns
+        /// A result indicating success or error in sending data.
+        fn send(&mut self, data: &[u8]) -> crate::GDResult<()> {
+            let info = CapturePacket {
+                direction: Direction::Send,
+                protocol: P::protocol(),
+                remote_address: &self.remote_address,
+                local_address: &self.local_addr().unwrap(),
+            };
+
+            if let Some(writer) = CAPTURE_WRITER.lock().unwrap().as_mut() {
+                writer.write(&info, data)?;
+            }
+
+            self.inner.send(data)
+        }
+
+        /// Receives data from the socket and captures the packet.
+        ///
+        /// The method receives data using the inner socket and captures the incoming packet
+        /// if a capture writer is set.
+        ///
+        /// # Arguments
+        /// * `size` - Optional size of data to receive.
+        ///
+        /// # Returns
+        /// A result containing received data or an error.
+        fn receive(&mut self, size: Option<usize>) -> crate::GDResult<Vec<u8>> {
+            let data = self.inner.receive(size)?;
+            let info = CapturePacket {
+                direction: Direction::Receive,
+                protocol: P::protocol(),
+                remote_address: &self.remote_address,
+                local_address: &self.local_addr().unwrap(),
+            };
+
+            if let Some(writer) = CAPTURE_WRITER.lock().unwrap().as_mut() {
+                writer.write(&info, &data)?;
+            }
+
+            Ok(data)
+        }
+
+        /// Applies timeout settings to the wrapped socket.
+        ///
+        /// Delegates the operation to the inner socket implementation.
+        ///
+        /// # Arguments
+        /// * `timeout_settings` - Optional timeout settings to apply.
+        ///
+        /// # Returns
+        /// A result indicating success or error in applying timeouts.
+        fn apply_timeout(
+            &self,
+            timeout_settings: &Option<crate::protocols::types::TimeoutSettings>,
+        ) -> crate::GDResult<()> {
+            self.inner.apply_timeout(timeout_settings)
+        }
+
+        /// Returns the remote port of the wrapped socket.
+        ///
+        /// Delegates the operation to the inner socket implementation.
+        ///
+        /// # Returns
+        /// The remote port number.
+        fn port(&self) -> u16 {
+            self.inner.port()
+        }
+
+        /// Returns the local SocketAddr of the wrapped socket.
+        ///
+        /// Delegates the operation to the inner socket implementation.
+        ///
+        /// # Returns
+        /// The local SocketAddr.
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+    }
+
+    /// A specialized `WrappedCaptureSocket` for UDP, using `UdpSocketImpl` as the inner socket
+    /// and `ProtocolUDP` as the protocol provider.
+    ///
+    /// This type captures and processes UDP packets, wrapping around standard UDP socket
+    /// functionalities with additional packet capture capabilities.
+    pub type CapturedUdpSocket = WrappedCaptureSocket<UdpSocketImpl, ProtocolUDP>;
+
+    /// A specialized `WrappedCaptureSocket` for TCP, using `TcpSocketImpl` as the inner socket
+    /// and `ProtocolTCP` as the protocol provider.
+    ///
+    /// This type captures and processes TCP packets, wrapping around standard TCP socket
+    /// functionalities with additional packet capture capabilities.
+    pub type CapturedTcpSocket = WrappedCaptureSocket<TcpSocketImpl, ProtocolTCP>;
+}
+
+#[cfg(not(feature = "packet_capture"))]
+pub type UdpSocket = UdpSocketImpl;
+#[cfg(not(feature = "packet_capture"))]
+pub type TcpSocket = TcpSocketImpl;
+
+#[cfg(feature = "packet_capture")]
+pub type UdpSocket = capture::CapturedUdpSocket;
+#[cfg(feature = "packet_capture")]
+pub type TcpSocket = capture::CapturedTcpSocket;
 
 #[cfg(test)]
 mod tests {

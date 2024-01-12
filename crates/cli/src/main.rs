@@ -1,7 +1,10 @@
 use std::net::{IpAddr, ToSocketAddrs};
 
 use clap::{Parser, ValueEnum};
-use gamedig::{games::*, protocols::types::CommonResponse, ExtraRequestSettings, TimeoutSettings};
+use gamedig::{
+    games::*,
+    protocols::types::{CommonResponse, ExtraRequestSettings, TimeoutSettings},
+};
 
 mod error;
 
@@ -34,6 +37,10 @@ struct Cli {
     /// Which response variant to use when outputting.
     #[arg(short, long, default_value = "generic")]
     output_mode: OutputMode,
+
+    #[cfg(feature = "packet_capture")]
+    #[arg(short, long)]
+    capture: Option<String>,
 
     /// Optional timeout settings for the server query.
     #[command(flatten, next_help_heading = "Timeouts")]
@@ -82,14 +89,13 @@ fn find_game(game_id: &str) -> Result<&'static Game> {
 /// * `Result<IpAddr>` - On sucess returns a resolved IP address; on failure
 ///   returns an [Error::InvalidHostname] error.
 fn resolve_ip_or_domain(host: &str, extra_options: &mut Option<ExtraRequestSettings>) -> Result<IpAddr> {
-    host.parse().map_or_else(
-        |_| {
-            set_hostname_if_missing(host, extra_options);
+    if let Ok(parsed_ip) = host.parse() {
+        Ok(parsed_ip)
+    } else {
+        set_hostname_if_missing(host, extra_options);
 
-            resolve_domain(host)
-        },
-        Ok,
-    )
+        resolve_domain(host)
+    }
 }
 
 /// Resolve a domain name to one of its IP addresses (the first one returned).
@@ -174,6 +180,9 @@ fn main() -> Result<()> {
 
     // Resolve the IP address
     let ip = resolve_ip_or_domain(&args.ip, &mut extra_options)?;
+
+    #[cfg(feature = "packet_capture")]
+    gamedig::capture::setup_capture(args.capture);
 
     // Query the server using game definition, parsed IP, and user command line
     // flags.

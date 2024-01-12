@@ -45,13 +45,11 @@ mod buffer;
 mod socket;
 mod utils;
 
+#[cfg(feature = "packet_capture")]
+pub(crate) mod capture;
+
 pub use errors::*;
 #[cfg(feature = "games")]
 pub use games::*;
-#[cfg(feature = "games")]
-pub use query::*;
 #[cfg(feature = "services")]
 pub use services::*;
-
-// Re-export types needed to call games::query::query in the root
-pub use protocols::types::{ExtraRequestSettings, TimeoutSettings};
