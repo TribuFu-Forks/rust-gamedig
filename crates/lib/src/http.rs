@@ -113,12 +113,20 @@ impl HttpClient {
 
     /// Send a HTTP GET request and parse the JSON resonse.
     #[cfg(feature = "serde")]
-    pub fn get_json<T: DeserializeOwned>(&mut self, path: &str) -> GDResult<T> { self.request_json("GET", path) }
+    pub fn get_json<T: DeserializeOwned>(&mut self, path: &str) -> GDResult<T> {
+        self.request_json("GET", path)
+    }
 
     /// Send a HTTP Post request with JSON data and parse a JSON response.
     #[cfg(feature = "serde")]
     pub fn post_json<T: DeserializeOwned, S: Serialize>(&mut self, path: &str, data: S) -> GDResult<T> {
         self.request_with_json_data("POST", path, data)
+    }
+
+    /// Send a HTTP Post request with form data and parse a JSON response.
+    #[cfg(feature = "serde")]
+    pub fn post_form<T: DeserializeOwned>(&mut self, path: &str, data: &[(&str, &str)]) -> GDResult<T> {
+        self.request_with_form_data("POST", path, data)
     }
 
     // NOTE: More methods can be added here as required
@@ -149,6 +157,24 @@ impl HttpClient {
         self.client
             .request_url(method, &self.address)
             .send_json(data)
+            .map_err(|e| PacketSend.context(e))?
+            .into_json::<T>()
+            .map_err(|e| ProtocolFormat.context(e))
+    }
+
+    /// Send a HTTP request with form data and parse the JSON response.
+    #[inline]
+    #[cfg(feature = "serde")]
+    fn request_with_form_data<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        path: &str,
+        data: &[(&str, &str)],
+    ) -> GDResult<T> {
+        self.address.set_path(path);
+        self.client
+            .request_url(method, &self.address)
+            .send_form(data)
             .map_err(|e| PacketSend.context(e))?
             .into_json::<T>()
             .map_err(|e| ProtocolFormat.context(e))

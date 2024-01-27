@@ -15,4 +15,8 @@ pub mod unreal2;
 /// Reference: [Server Query](https://developer.valvesoftware.com/wiki/Server_queries)
 pub mod valve;
 
+/// Reference: [EOS Web API](https://dev.epicgames.com/docs/web-api-ref)
+#[cfg(feature = "serde")]
+pub mod epic;
+
 pub use types::{ExtraRequestSettings, GenericResponse, Protocol};
